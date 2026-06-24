@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -43,9 +44,14 @@ func (r *Routes) RegisterRoutes(ctx httpinternal.RouterContext) {
 	group.GET("/experiments", r.handleListExperiments)
 	group.POST("/experiments", r.handleCreateExperiment)
 	group.GET("/experiments/:id", r.handleGetExperiment)
+	group.GET("/experiments/:id/context", r.handleGetExperimentContext)
 	group.POST("/experiments/:id/events", r.handleAppendEvent)
 	group.PATCH("/experiments/:id/status", r.handleUpdateStatus)
 	group.POST("/experiments/:id/results", r.handleRecordResults)
+
+	group.GET("/docs/search", r.handleSearchDocuments)
+	group.GET("/docs/read", r.handleReadDocument)
+	group.GET("/docs/recent", r.handleRecentDocuments)
 }
 
 func (r *Routes) requireWriter(ctx httpinternal.RouterContext) gin.HandlerFunc {
@@ -225,6 +231,60 @@ func (r *Routes) handleListExperiments(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"experiments": out})
 }
 
+func (r *Routes) handleSearchDocuments(c *gin.Context) {
+	out, err := r.service.SearchDocuments(c.Request.Context(), coreresearch.SearchDocumentsInput{
+		Query:   c.Query("q"),
+		Project: c.Query("project"),
+		Kind:    c.Query("kind"),
+		Offset:  queryInt(c, "offset"),
+		Limit:   queryInt(c, "limit"),
+	})
+	if err != nil {
+		respondWithResearchErrorForErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (r *Routes) handleReadDocument(c *gin.Context) {
+	out, err := r.service.ReadDocument(c.Request.Context(), coreresearch.ReadDocumentInput{
+		ID:   c.Query("id"),
+		Path: c.Query("path"),
+	})
+	if err != nil {
+		respondWithResearchErrorForErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"document": out})
+}
+
+func (r *Routes) handleRecentDocuments(c *gin.Context) {
+	out, err := r.service.RecentDocuments(c.Request.Context(), coreresearch.RecentDocumentsInput{
+		Project: c.Query("project"),
+		Kind:    c.Query("kind"),
+		Limit:   queryInt(c, "limit"),
+	})
+	if err != nil {
+		respondWithResearchErrorForErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (r *Routes) handleGetExperimentContext(c *gin.Context) {
+	out, err := r.service.GetExperimentContext(
+		c.Request.Context(),
+		strings.TrimSpace(c.Param("id")),
+		c.Query("q"),
+		queryInt(c, "limit"),
+	)
+	if err != nil {
+		respondWithResearchErrorForErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
 func currentUserID(c *gin.Context) string {
 	user := authmw.TryGetUser(c)
 	if user == nil || strings.TrimSpace(user.ID) == "" {
@@ -233,12 +293,28 @@ func currentUserID(c *gin.Context) string {
 	return user.ID
 }
 
+func queryInt(c *gin.Context, key string) int {
+	value := strings.TrimSpace(c.Query(key))
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func respondWithResearchErrorForErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, coreresearch.ErrInvalidInput):
 		respondWithResearchError(c, http.StatusBadRequest, "invalid_research_input", err.Error())
 	case errors.Is(err, coreresearch.ErrExperimentNotFound):
 		respondWithResearchError(c, http.StatusNotFound, "experiment_not_found", "Experiment not found")
+	case errors.Is(err, coreresearch.ErrDocumentNotFound):
+		respondWithResearchError(c, http.StatusNotFound, "document_not_found", "Document not found")
+	case errors.Is(err, coreresearch.ErrSearchUnavailable):
+		respondWithResearchError(c, http.StatusServiceUnavailable, "search_unavailable", "Document search is unavailable")
 	default:
 		respondWithResearchError(c, http.StatusInternalServerError, "research_internal_error", err.Error())
 	}

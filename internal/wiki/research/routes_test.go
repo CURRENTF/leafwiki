@@ -3,6 +3,7 @@ package research
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/perber/wiki/internal/core/tree"
 	httpinternal "github.com/perber/wiki/internal/http"
 	coreresearch "github.com/perber/wiki/internal/research"
+	coresearch "github.com/perber/wiki/internal/search"
 )
 
 func newResearchTestRouter(t *testing.T) *httptest.Server {
@@ -26,8 +28,18 @@ func newResearchTestRouter(t *testing.T) *httptest.Server {
 	if err := treeSvc.LoadTree(); err != nil {
 		t.Fatalf("load tree: %v", err)
 	}
+	index, err := coresearch.NewSQLiteIndex(tmp)
+	if err != nil {
+		t.Fatalf("new search index: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := index.Close(); err != nil {
+			t.Fatalf("close search index: %v", err)
+		}
+	})
 	svc := coreresearch.NewService(coreresearch.Config{
-		Tree: treeSvc,
+		Tree:   treeSvc,
+		Search: index,
 		Now: func() time.Time {
 			return time.Date(2026, 6, 24, 4, 5, 6, 0, time.UTC)
 		},
@@ -114,5 +126,70 @@ func TestResearchRoutesAcceptBasicAuthPassword(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status with basic auth = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+func TestResearchRoutesExposeDocumentSearchAndReadForAgents(t *testing.T) {
+	server := newResearchTestRouter(t)
+	defer server.Close()
+
+	body := `{"project":"DeltaKV","title":"Agent readable run","slugHint":"agent-readable-run","goal":"Preserve a unique context-token for agent lookup."}`
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/research/experiments", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Research-Password", "secret-password")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create experiment: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, server.URL+"/api/research/docs/search?q=context-token&project=DeltaKV&kind=page", nil)
+	if err != nil {
+		t.Fatalf("new search request: %v", err)
+	}
+	req.Header.Set("X-Research-Password", "secret-password")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("search documents: %v", err)
+	}
+	defer resp.Body.Close()
+	searchBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read search body: %v", err)
+	}
+	searchBody := string(searchBytes)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search status = %d, body=%s", resp.StatusCode, searchBody)
+	}
+	if !strings.Contains(searchBody, `"path":"projects/deltakv/experiments/2026/06/deltakv-20260624-agent-readable-run"`) {
+		t.Fatalf("search body missing experiment path:\n%s", searchBody)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, server.URL+"/api/research/docs/read?path=projects/deltakv/experiments/2026/06/deltakv-20260624-agent-readable-run", nil)
+	if err != nil {
+		t.Fatalf("new read request: %v", err)
+	}
+	req.Header.Set("X-Research-Password", "secret-password")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("read document: %v", err)
+	}
+	defer resp.Body.Close()
+	readBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read document body: %v", err)
+	}
+	readBody := string(readBytes)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("read status = %d, body=%s", resp.StatusCode, readBody)
+	}
+	if !strings.Contains(readBody, `Preserve a unique context-token for agent lookup.`) {
+		t.Fatalf("read body missing markdown:\n%s", readBody)
 	}
 }

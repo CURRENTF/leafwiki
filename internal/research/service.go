@@ -9,8 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/perber/wiki/internal/core/excerpt"
 	"github.com/perber/wiki/internal/core/markdown"
 	"github.com/perber/wiki/internal/core/tree"
+	coresearch "github.com/perber/wiki/internal/search"
 )
 
 const (
@@ -31,11 +33,14 @@ const (
 var (
 	ErrInvalidInput       = errors.New("invalid research input")
 	ErrExperimentNotFound = errors.New("research experiment not found")
+	ErrDocumentNotFound   = errors.New("research document not found")
+	ErrSearchUnavailable  = errors.New("research document search is unavailable")
 )
 
 type Service struct {
 	tree      *tree.TreeService
 	slugger   *tree.SlugService
+	search    *coresearch.SQLiteIndex
 	committer *GitCommitter
 	now       func() time.Time
 	mu        sync.Mutex
@@ -43,6 +48,7 @@ type Service struct {
 
 type Config struct {
 	Tree      *tree.TreeService
+	Search    *coresearch.SQLiteIndex
 	Committer *GitCommitter
 	Now       func() time.Time
 }
@@ -55,6 +61,7 @@ func NewService(cfg Config) *Service {
 	return &Service{
 		tree:      cfg.Tree,
 		slugger:   tree.NewSlugService(),
+		search:    cfg.Search,
 		committer: cfg.Committer,
 		now:       now,
 	}
@@ -126,6 +133,61 @@ type Experiment struct {
 	Content     string                 `json:"content,omitempty"`
 	Created     bool                   `json:"created,omitempty"`
 	CommitHash  string                 `json:"commitHash,omitempty"`
+}
+
+type Document struct {
+	ID           string                 `json:"id"`
+	Path         string                 `json:"path"`
+	Title        string                 `json:"title"`
+	Kind         string                 `json:"kind"`
+	Project      string                 `json:"project,omitempty"`
+	ResearchID   string                 `json:"researchId,omitempty"`
+	ResearchKind string                 `json:"researchKind,omitempty"`
+	Status       string                 `json:"status,omitempty"`
+	Tags         []string               `json:"tags,omitempty"`
+	Snippet      string                 `json:"snippet,omitempty"`
+	Markdown     string                 `json:"markdown,omitempty"`
+	Frontmatter  map[string]interface{} `json:"frontmatter,omitempty"`
+	CreatedAt    string                 `json:"createdAt,omitempty"`
+	UpdatedAt    string                 `json:"updatedAt,omitempty"`
+}
+
+type SearchDocumentsInput struct {
+	Query   string
+	Project string
+	Kind    string
+	Offset  int
+	Limit   int
+}
+
+type SearchDocumentsOutput struct {
+	Query  string     `json:"query"`
+	Count  int        `json:"count"`
+	Offset int        `json:"offset"`
+	Limit  int        `json:"limit"`
+	Items  []Document `json:"items"`
+}
+
+type ReadDocumentInput struct {
+	ID   string
+	Path string
+}
+
+type RecentDocumentsInput struct {
+	Project string
+	Kind    string
+	Limit   int
+}
+
+type RecentDocumentsOutput struct {
+	Items []Document `json:"items"`
+}
+
+type ExperimentContext struct {
+	Experiment  *Experiment `json:"experiment"`
+	Query       string      `json:"query"`
+	RelatedDocs []Document  `json:"relatedDocs"`
+	RecentDocs  []Document  `json:"recentDocs"`
 }
 
 func (s *Service) CreateExperiment(ctx context.Context, input CreateExperimentInput) (*Experiment, error) {
@@ -207,6 +269,9 @@ func (s *Service) CreateExperiment(ctx context.Context, input CreateExperimentIn
 		return nil, err
 	}
 	if err := s.tree.UpdateNode(userID, page.ID, title, canonicalID, &raw, page.Version(), true); err != nil {
+		return nil, err
+	}
+	if err := s.indexPageByID(page.ID); err != nil {
 		return nil, err
 	}
 
@@ -379,6 +444,173 @@ func (s *Service) ListExperiments(ctx context.Context, projectFilter, statusFilt
 	return out, nil
 }
 
+func (s *Service) SearchDocuments(ctx context.Context, input SearchDocumentsInput) (*SearchDocumentsOutput, error) {
+	_ = ctx
+	if s == nil || s.tree == nil {
+		return nil, fmt.Errorf("research service is not initialized")
+	}
+	if s.search == nil {
+		return nil, ErrSearchUnavailable
+	}
+
+	query := strings.TrimSpace(input.Query)
+	if query == "" {
+		return nil, fmt.Errorf("%w: q is required", ErrInvalidInput)
+	}
+	offset := normalizeOffset(input.Offset)
+	limit := normalizeLimit(input.Limit, 20, 50)
+	project := s.slugger.GenerateValidSlug(input.Project)
+	kind := normalizeNodeKind(input.Kind)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pageIDs, err := s.filteredPageIDs(project, kind)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.search.Search(query, pageIDs, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := &SearchDocumentsOutput{
+		Query:  query,
+		Count:  result.Count,
+		Offset: result.Offset,
+		Limit:  result.Limit,
+		Items:  make([]Document, 0, len(result.Items)),
+	}
+	for _, item := range result.Items {
+		page, err := s.tree.GetPage(item.PageID)
+		if err != nil {
+			continue
+		}
+		doc, err := s.documentFromPage(page, false)
+		if err != nil {
+			continue
+		}
+		doc.Snippet = plainSnippet(item.Excerpt)
+		out.Items = append(out.Items, *doc)
+	}
+	return out, nil
+}
+
+func (s *Service) ReadDocument(ctx context.Context, input ReadDocumentInput) (*Document, error) {
+	_ = ctx
+	if s == nil || s.tree == nil {
+		return nil, fmt.Errorf("research service is not initialized")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	page, err := s.findDocument(input.ID, input.Path)
+	if err != nil {
+		return nil, err
+	}
+	return s.documentFromPage(page, true)
+}
+
+func (s *Service) RecentDocuments(ctx context.Context, input RecentDocumentsInput) (*RecentDocumentsOutput, error) {
+	_ = ctx
+	if s == nil || s.tree == nil {
+		return nil, fmt.Errorf("research service is not initialized")
+	}
+
+	limit := normalizeLimit(input.Limit, 20, 50)
+	project := s.slugger.GenerateValidSlug(input.Project)
+	kind := normalizeNodeKind(input.Kind)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	docs := make([]Document, 0)
+	if err := s.tree.WalkNodes(func(id string) error {
+		page, err := s.tree.GetPage(id)
+		if err != nil {
+			return nil
+		}
+		if !matchesDocumentFilter(page, project, kind) {
+			return nil
+		}
+		doc, err := s.documentFromPage(page, false)
+		if err != nil {
+			return nil
+		}
+		docs = append(docs, *doc)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(docs, func(i, j int) bool {
+		left := docs[i].UpdatedAt
+		right := docs[j].UpdatedAt
+		if left == right {
+			return docs[i].Path < docs[j].Path
+		}
+		return left > right
+	})
+	if len(docs) > limit {
+		docs = docs[:limit]
+	}
+	return &RecentDocumentsOutput{Items: docs}, nil
+}
+
+func (s *Service) GetExperimentContext(ctx context.Context, id, query string, limit int) (*ExperimentContext, error) {
+	_ = ctx
+	s.mu.Lock()
+	page, _, _, err := s.loadExperiment(id)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	exp, err := s.experimentFromPage(page, true)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	limit = normalizeLimit(limit, 10, 30)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		query = strings.TrimSpace(strings.Join(append([]string{exp.Title}, exp.Tags...), " "))
+	}
+
+	var related []Document
+	if query != "" && s.search != nil {
+		searchOut, err := s.SearchDocuments(ctx, SearchDocumentsInput{
+			Query:   query,
+			Project: exp.Project,
+			Limit:   limit,
+		})
+		if err != nil && !errors.Is(err, ErrInvalidInput) {
+			return nil, err
+		}
+		if searchOut != nil {
+			related = excludeDocument(searchOut.Items, exp.PageID)
+		}
+	}
+
+	recentOut, err := s.RecentDocuments(ctx, RecentDocumentsInput{
+		Project: exp.Project,
+		Limit:   limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	recent := excludeDocument(recentOut.Items, exp.PageID)
+	if len(recent) > limit {
+		recent = recent[:limit]
+	}
+
+	return &ExperimentContext{
+		Experiment:  exp,
+		Query:       query,
+		RelatedDocs: related,
+		RecentDocs:  recent,
+	}, nil
+}
+
 func (s *Service) createExperimentFields(id, project, slug, title, status string, now time.Time, input CreateExperimentInput) map[string]interface{} {
 	fields := map[string]interface{}{
 		FieldID:        id,
@@ -494,7 +726,10 @@ func (s *Service) writeExperiment(page *tree.Page, fm markdown.Frontmatter, body
 	if err != nil {
 		return err
 	}
-	return s.tree.UpdateNode(userID, page.ID, page.Title, page.Slug, &raw, page.Version(), true)
+	if err := s.tree.UpdateNode(userID, page.ID, page.Title, page.Slug, &raw, page.Version(), true); err != nil {
+		return err
+	}
+	return s.indexPageByID(page.ID)
 }
 
 func (s *Service) experimentFromPage(page *tree.Page, includeContent bool) (*Experiment, error) {
@@ -530,6 +765,124 @@ func (s *Service) experimentFromPage(page *tree.Page, includeContent bool) (*Exp
 		exp.Content = body
 	}
 	return exp, nil
+}
+
+func (s *Service) findDocument(id, path string) (*tree.Page, error) {
+	id = strings.TrimSpace(id)
+	path = normalizeRoutePath(path)
+	if id == "" && path == "" {
+		return nil, fmt.Errorf("%w: id or path is required", ErrInvalidInput)
+	}
+	if id != "" {
+		page, err := s.tree.GetPage(id)
+		if err != nil {
+			if errors.Is(err, tree.ErrPageNotFound) {
+				return nil, ErrDocumentNotFound
+			}
+			return nil, err
+		}
+		return page, nil
+	}
+	page, err := s.tree.FindPageByRoutePath(path)
+	if err != nil {
+		if errors.Is(err, tree.ErrPageNotFound) {
+			return nil, ErrDocumentNotFound
+		}
+		return nil, err
+	}
+	return page, nil
+}
+
+func (s *Service) documentFromPage(page *tree.Page, includeMarkdown bool) (*Document, error) {
+	if page == nil {
+		return nil, ErrDocumentNotFound
+	}
+	raw, err := s.tree.ReadPageRaw(page.ID)
+	if err != nil {
+		return nil, err
+	}
+	fm, body, has, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !has {
+		fm = markdown.Frontmatter{ExtraFields: map[string]interface{}{}}
+	}
+	if fm.ExtraFields == nil {
+		fm.ExtraFields = map[string]interface{}{}
+	}
+
+	path := strings.Trim(page.CalculatePath(), "/")
+	doc := &Document{
+		ID:           page.ID,
+		Path:         path,
+		Title:        page.Title,
+		Kind:         string(page.Kind),
+		Project:      firstNonEmpty(stringField(fm.ExtraFields, FieldProject), projectFromPath(path)),
+		ResearchID:   stringField(fm.ExtraFields, FieldID),
+		ResearchKind: stringField(fm.ExtraFields, FieldKind),
+		Status:       stringField(fm.ExtraFields, FieldStatus),
+		Tags:         stringSliceField(fm.ExtraFields, FieldTags),
+		Snippet:      excerpt.FromBody(body),
+		CreatedAt:    formatTime(page.Metadata.CreatedAt),
+		UpdatedAt:    formatTime(page.Metadata.UpdatedAt),
+	}
+	if len(fm.ExtraFields) > 0 {
+		doc.Frontmatter = fm.ExtraFields
+	}
+	if includeMarkdown {
+		doc.Markdown = body
+	}
+	return doc, nil
+}
+
+func (s *Service) filteredPageIDs(project, kind string) ([]string, error) {
+	if project == "" && kind == "" {
+		return nil, nil
+	}
+	pageIDs := make([]string, 0)
+	if err := s.tree.WalkNodes(func(id string) error {
+		page, err := s.tree.GetPage(id)
+		if err != nil {
+			return nil
+		}
+		if matchesDocumentFilter(page, project, kind) {
+			pageIDs = append(pageIDs, page.ID)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return pageIDs, nil
+}
+
+func matchesDocumentFilter(page *tree.Page, project, kind string) bool {
+	if page == nil {
+		return false
+	}
+	if kind != "" && string(page.Kind) != kind {
+		return false
+	}
+	if project == "" {
+		return true
+	}
+	return pathHasProject(strings.Trim(page.CalculatePath(), "/"), project)
+}
+
+func (s *Service) indexPageByID(pageID string) error {
+	if s.search == nil {
+		return nil
+	}
+	page, err := s.tree.GetPage(pageID)
+	if err != nil {
+		return err
+	}
+	path := strings.Trim(page.CalculatePath(), "/")
+	filePath := path
+	if filePath != "" {
+		filePath += ".md"
+	}
+	return s.search.IndexPage(path, filePath, page.ID, page.Title, page.Kind, page.RawContent)
 }
 
 func (s *Service) commit(message string) (string, error) {
@@ -749,4 +1102,87 @@ func sortedKeys(m map[string]interface{}) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func normalizeRoutePath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimSuffix(path, ".md")
+	path = strings.Trim(path, "/")
+	parts := strings.Split(path, "/")
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			return ""
+		}
+		clean = append(clean, part)
+	}
+	return strings.Join(clean, "/")
+}
+
+func normalizeOffset(offset int) int {
+	if offset < 0 {
+		return 0
+	}
+	return offset
+}
+
+func normalizeLimit(limit, fallback, max int) int {
+	if limit <= 0 {
+		limit = fallback
+	}
+	if limit > max {
+		return max
+	}
+	return limit
+}
+
+func normalizeNodeKind(kind string) string {
+	kind = strings.TrimSpace(strings.ToLower(kind))
+	switch kind {
+	case "", string(tree.NodeKindPage), string(tree.NodeKindSection):
+		return kind
+	default:
+		return ""
+	}
+}
+
+func projectFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "projects" {
+		return parts[1]
+	}
+	return ""
+}
+
+func pathHasProject(path, project string) bool {
+	return strings.HasPrefix(strings.Trim(path, "/")+"/", "projects/"+project+"/")
+}
+
+func plainSnippet(snippet string) string {
+	snippet = strings.ReplaceAll(snippet, "<b>", "")
+	snippet = strings.ReplaceAll(snippet, "</b>", "")
+	return strings.TrimSpace(snippet)
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func excludeDocument(items []Document, pageID string) []Document {
+	out := make([]Document, 0, len(items))
+	for _, item := range items {
+		if item.ID == pageID {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }

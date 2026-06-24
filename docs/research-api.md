@@ -130,3 +130,38 @@ curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
 curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
   "$BASE_URL/api/research/experiments/$ID"
 ```
+
+Search documents before writing:
+
+```bash
+curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
+  "$BASE_URL/api/research/docs/search?q=SCBench%20SCDQ&project=DeltaKV&limit=10"
+```
+
+Search returns page metadata and short snippets only. Use `project` to scope to
+`projects/<project>/...`, and `kind=page` or `kind=section` to restrict node
+types. Read the Markdown body only after selecting a relevant path:
+
+```bash
+curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
+  "$BASE_URL/api/research/docs/read?path=projects/deltakv/experiments/2026/06/deltakv-20260624-qwen3-kvzip-scdq-r02"
+```
+
+Recent documents are useful when an agent needs a quick project-level context
+window:
+
+```bash
+curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
+  "$BASE_URL/api/research/docs/recent?project=DeltaKV&kind=page&limit=20"
+```
+
+For an existing experiment, agents can ask for a compact context bundle:
+
+```bash
+curl -H "Authorization: Bearer $LEAFWIKI_RESEARCH_API_TOKEN" \
+  "$BASE_URL/api/research/experiments/$ID/context?limit=10"
+```
+
+The bundle includes the experiment Markdown plus related and recent document
+snippets. Agents should then call `/api/research/docs/read` for any full
+Markdown documents they need.

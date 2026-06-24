@@ -315,6 +315,7 @@ func (w *Wiki) initResearch(options *WikiOptions) {
 	}
 	w.research = research.NewService(research.Config{
 		Tree:      w.tree,
+		Search:    w.searchIndex,
 		Committer: committer,
 	})
 }
