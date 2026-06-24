@@ -65,6 +65,12 @@ func writeUsage(w io.Writer) {
 	--git-backup-ssh-key           Raw SSH private key for git backup (env var preferred)
 	--git-backup-ssh-known-hosts   Path to known_hosts file for SSH host key verification (MITM protection)
 	--git-backup-interval          Git backup interval (e.g. 60m, 2h); 0 = manual-only, no automatic scheduling (default: 60m)
+	--enable-research-api          Enable agent-facing research record API (default: false)
+	--research-api-token           Bearer token accepted by the research API (recommended for public servers)
+	--research-api-password        Password accepted by the research API via X-Research-Password or HTTP Basic
+	--research-git-autocommit      Create a local git commit after each research API write (default: false)
+	--research-git-author-name     Git author name for research API commits (default: LeafWiki Research Agent)
+	--research-git-author-email    Git author email for research API commits (default: research-agent@leafwiki.local)
 
 	Environment variables:
 	LEAFWIKI_HOST
@@ -101,6 +107,12 @@ func writeUsage(w io.Writer) {
 	LEAFWIKI_GIT_BACKUP_SSH_KEY
 	LEAFWIKI_GIT_BACKUP_SSH_KNOWN_HOSTS
 	LEAFWIKI_GIT_BACKUP_INTERVAL
+	LEAFWIKI_ENABLE_RESEARCH_API
+	LEAFWIKI_RESEARCH_API_TOKEN
+	LEAFWIKI_RESEARCH_API_PASSWORD
+	LEAFWIKI_RESEARCH_GIT_AUTOCOMMIT
+	LEAFWIKI_RESEARCH_GIT_AUTHOR_NAME
+	LEAFWIKI_RESEARCH_GIT_AUTHOR_EMAIL
 	`); err != nil {
 		panic(err)
 	}
@@ -166,6 +178,12 @@ type cliFlags struct {
 	gitBackupSSHKey         *string
 	gitBackupSSHKnownHosts  *string
 	gitBackupInterval       *time.Duration
+	enableResearchAPI       *bool
+	researchAPIToken        *string
+	researchAPIPassword     *string
+	researchGitAutoCommit   *bool
+	researchGitAuthorName   *string
+	researchGitAuthorEmail  *string
 	revisionCoalesceWindow  *time.Duration
 }
 
@@ -203,6 +221,12 @@ func registerFlags(fs *flag.FlagSet) *cliFlags {
 		gitBackupSSHKey:         fs.String("git-backup-ssh-key", "", "raw SSH private key for git backup (env var preferred)"),
 		gitBackupSSHKnownHosts:  fs.String("git-backup-ssh-known-hosts", "", "path to known_hosts file for SSH host key verification (MITM protection)"),
 		gitBackupInterval:       fs.Duration("git-backup-interval", 60*time.Minute, "git backup interval (e.g. 60m, 2h); 0 = manual-only, no automatic scheduling (default: 60m)"),
+		enableResearchAPI:       fs.Bool("enable-research-api", false, "enable agent-facing research record API (default: false)"),
+		researchAPIToken:        fs.String("research-api-token", "", "bearer token accepted by the research API"),
+		researchAPIPassword:     fs.String("research-api-password", "", "password accepted by the research API via X-Research-Password or HTTP Basic"),
+		researchGitAutoCommit:   fs.Bool("research-git-autocommit", false, "create a local git commit after each research API write (default: false)"),
+		researchGitAuthorName:   fs.String("research-git-author-name", "", "git author name for research API commits (default: LeafWiki Research Agent)"),
+		researchGitAuthorEmail:  fs.String("research-git-author-email", "", "git author email for research API commits (default: research-agent@leafwiki.local)"),
 		revisionCoalesceWindow:  fs.Duration("revision-coalesce-window", 5*time.Minute, "window for coalescing rapid successive saves by the same author; 0 = disabled (default: 5m)"),
 	}
 }
@@ -257,6 +281,12 @@ func main() {
 	gitBackupSSHKey := resolveString("git-backup-ssh-key", *flags.gitBackupSSHKey, visited, "LEAFWIKI_GIT_BACKUP_SSH_KEY", "")
 	gitBackupInterval := resolveDuration("git-backup-interval", *flags.gitBackupInterval, visited, "LEAFWIKI_GIT_BACKUP_INTERVAL")
 	gitBackupSSHKnownHosts := resolveString("git-backup-ssh-known-hosts", *flags.gitBackupSSHKnownHosts, visited, "LEAFWIKI_GIT_BACKUP_SSH_KNOWN_HOSTS", "")
+	enableResearchAPI := resolveBool("enable-research-api", *flags.enableResearchAPI, visited, "LEAFWIKI_ENABLE_RESEARCH_API")
+	researchAPIToken := resolveString("research-api-token", *flags.researchAPIToken, visited, "LEAFWIKI_RESEARCH_API_TOKEN", "")
+	researchAPIPassword := resolveString("research-api-password", *flags.researchAPIPassword, visited, "LEAFWIKI_RESEARCH_API_PASSWORD", "")
+	researchGitAutoCommit := resolveBool("research-git-autocommit", *flags.researchGitAutoCommit, visited, "LEAFWIKI_RESEARCH_GIT_AUTOCOMMIT")
+	researchGitAuthorName := resolveString("research-git-author-name", *flags.researchGitAuthorName, visited, "LEAFWIKI_RESEARCH_GIT_AUTHOR_NAME", "LeafWiki Research Agent")
+	researchGitAuthorEmail := resolveString("research-git-author-email", *flags.researchGitAuthorEmail, visited, "LEAFWIKI_RESEARCH_GIT_AUTHOR_EMAIL", "research-agent@leafwiki.local")
 	trustedProxies, err := authmw.ParseTrustedProxies(trustedProxyIPsRaw)
 	if err != nil {
 		fail("invalid --trusted-proxy-ips value", "error", err)
@@ -277,6 +307,9 @@ func main() {
 	// Note: git-backup-remote is optional (local-only mode is supported)
 	if gitBackupEnabled && gitBackupRemote != "" && gitBackupSSHKey == "" && gitBackupSSHKeyPath == "" {
 		fail("--git-backup-ssh-key or --git-backup-ssh-key-path is required when --git-backup-remote is set. Use LEAFWIKI_GIT_BACKUP_SSH_KEY or LEAFWIKI_GIT_BACKUP_SSH_KEY_PATH.")
+	}
+	if enableResearchAPI && researchAPIToken == "" && researchAPIPassword == "" && !disableAuth {
+		slog.Default().Warn("research API enabled without LEAFWIKI_RESEARCH_API_TOKEN or LEAFWIKI_RESEARCH_API_PASSWORD; agents must use browser login cookies and CSRF tokens")
 	}
 
 	args := flag.Args()
@@ -338,6 +371,12 @@ func main() {
 		EnableRevision:         enableRevision,
 		MaxRevisionHistory:     maxRevisionHistory,
 		RevisionCoalesceWindow: revisionCoalesceWindow,
+		EnableResearchAPI:      enableResearchAPI,
+		ResearchAPIToken:       researchAPIToken,
+		ResearchAPIPassword:    researchAPIPassword,
+		ResearchGitAutoCommit:  researchGitAutoCommit,
+		ResearchGitAuthorName:  researchGitAuthorName,
+		ResearchGitAuthorEmail: researchGitAuthorEmail,
 	})
 	if err != nil {
 		fail("Failed to initialize Wiki", "error", err)

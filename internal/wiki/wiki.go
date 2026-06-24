@@ -16,6 +16,7 @@ import (
 	coreimporter "github.com/perber/wiki/internal/importer"
 	"github.com/perber/wiki/internal/links"
 	"github.com/perber/wiki/internal/properties"
+	"github.com/perber/wiki/internal/research"
 	"github.com/perber/wiki/internal/search"
 	"github.com/perber/wiki/internal/tags"
 	wikiassets "github.com/perber/wiki/internal/wiki/assets"
@@ -28,6 +29,7 @@ import (
 	wikipages "github.com/perber/wiki/internal/wiki/pages"
 	"github.com/perber/wiki/internal/wiki/pagesave"
 	wikiproperties "github.com/perber/wiki/internal/wiki/properties"
+	wikiresearch "github.com/perber/wiki/internal/wiki/research"
 	wikirevisions "github.com/perber/wiki/internal/wiki/revisions"
 	wikisearch "github.com/perber/wiki/internal/wiki/search"
 	wikitags "github.com/perber/wiki/internal/wiki/tags"
@@ -57,10 +59,12 @@ type Wiki struct {
 	brandingRoutes   *wikibranding.Routes
 	importerRoutes   *wikiimporter.Routes
 	healthRoutes     *wikihealth.Routes
+	researchRoutes   *wikiresearch.Routes
 	revision         *revision.Service
 	links            *links.LinkService
 	tags             *tags.TagsService
 	props            *properties.PropertiesService
+	research         *research.Service
 	backupRoutes     *wikibackup.Routes
 	log              *slog.Logger
 }
@@ -78,6 +82,12 @@ type WikiOptions struct {
 	MaxRevisionHistory      int           // Max revisions kept per page; 0 = unlimited
 	MaxAssetUploadSizeBytes int64         // Maximum allowed size in bytes for asset/import uploads; 0 = default
 	RevisionCoalesceWindow  time.Duration // Window for coalescing rapid successive saves; 0 = disabled
+	EnableResearchAPI       bool          // Whether the research agent API is enabled
+	ResearchAPIToken        string        // Bearer token accepted by the research agent API
+	ResearchAPIPassword     string        // Password accepted by the research agent API
+	ResearchGitAutoCommit   bool          // Whether research API writes create local git commits
+	ResearchGitAuthorName   string        // Git author name for research API commits
+	ResearchGitAuthorEmail  string        // Git author email for research API commits
 }
 
 func NewWiki(options *WikiOptions) (*Wiki, error) {
@@ -106,6 +116,9 @@ func NewWiki(options *WikiOptions) (*Wiki, error) {
 	}
 	if err := w.initBranding(); err != nil {
 		return nil, err
+	}
+	if options.EnableResearchAPI {
+		w.initResearch(options)
 	}
 	// Welcome page must exist before the revision service starts recording.
 	if err := w.EnsureWelcomePage(); err != nil {
@@ -290,6 +303,22 @@ func (w *Wiki) initBranding() error {
 	return nil
 }
 
+func (w *Wiki) initResearch(options *WikiOptions) {
+	var committer *research.GitCommitter
+	if options.ResearchGitAutoCommit {
+		committer = research.NewGitCommitter(research.GitConfig{
+			Enabled:     true,
+			StorageDir:  options.StorageDir,
+			AuthorName:  options.ResearchGitAuthorName,
+			AuthorEmail: options.ResearchGitAuthorEmail,
+		})
+	}
+	w.research = research.NewService(research.Config{
+		Tree:      w.tree,
+		Committer: committer,
+	})
+}
+
 func (w *Wiki) buildRoutes(options *WikiOptions) {
 	w.pagesRoutes = w.buildPagesRoutes()
 	w.authRoutes = w.buildAuthRoutes()
@@ -306,6 +335,14 @@ func (w *Wiki) buildRoutes(options *WikiOptions) {
 		Status:     w.status,
 		StorageDir: w.storageDir,
 	})
+	if w.research != nil {
+		w.researchRoutes = wikiresearch.NewRoutes(wikiresearch.RoutesConfig{
+			Service:     w.research,
+			AuthService: w.auth,
+			APIToken:    options.ResearchAPIToken,
+			APIPassword: options.ResearchAPIPassword,
+		})
+	}
 }
 
 // ─── Domain route builder helpers ────────────────────────────────────────────
@@ -463,8 +500,11 @@ func (w *Wiki) Registrars() []httpinternal.RouteRegistrar {
 		w.propertiesRoutes,
 		w.brandingRoutes,
 		w.importerRoutes,
-		w.healthRoutes,
 	}
+	if w.researchRoutes != nil {
+		registrars = append(registrars, w.researchRoutes)
+	}
+	registrars = append(registrars, w.healthRoutes)
 	if w.backupRoutes != nil {
 		registrars = append(registrars, w.backupRoutes)
 	}
