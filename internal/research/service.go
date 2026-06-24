@@ -593,6 +593,7 @@ func (s *Service) GetExperimentContext(ctx context.Context, id, query string, li
 
 	recentOut, err := s.RecentDocuments(ctx, RecentDocumentsInput{
 		Project: exp.Project,
+		Kind:    string(tree.NodeKindPage),
 		Limit:   limit,
 	})
 	if err != nil {
