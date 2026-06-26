@@ -293,3 +293,82 @@ func TestRecentDocumentsFiltersProjectAndKind(t *testing.T) {
 		t.Fatalf("unexpected recent item: %#v", out.Items[0])
 	}
 }
+
+func TestDocumentTreeKeepsAncestorsAndFiltersProjectAndKind(t *testing.T) {
+	svc, _ := newTestServiceWithSearch(t, time.Date(2026, 6, 24, 4, 5, 6, 0, time.UTC))
+	target, err := svc.CreateExperiment(context.Background(), CreateExperimentInput{
+		Project:  "DeltaKV",
+		Title:    "Tree target",
+		SlugHint: "tree-target",
+		Status:   "running",
+		Tags:     []string{"tree"},
+	})
+	if err != nil {
+		t.Fatalf("CreateExperiment target: %v", err)
+	}
+	support, err := svc.CreateExperiment(context.Background(), CreateExperimentInput{
+		Project:  "DeltaKV",
+		Title:    "Tree support",
+		SlugHint: "tree-support",
+		Status:   "completed",
+	})
+	if err != nil {
+		t.Fatalf("CreateExperiment support: %v", err)
+	}
+	other, err := svc.CreateExperiment(context.Background(), CreateExperimentInput{
+		Project:  "OtherProject",
+		Title:    "Tree other",
+		SlugHint: "tree-other",
+	})
+	if err != nil {
+		t.Fatalf("CreateExperiment other: %v", err)
+	}
+
+	out, err := svc.DocumentTree(context.Background(), DocumentTreeInput{
+		Project: "DeltaKV",
+		Kind:    "page",
+	})
+	if err != nil {
+		t.Fatalf("DocumentTree: %v", err)
+	}
+	if out.Project != "deltakv" || out.Kind != "page" {
+		t.Fatalf("filters = project %q kind %q, want deltakv/page", out.Project, out.Kind)
+	}
+	if out.Count != 2 {
+		t.Fatalf("count = %d, want 2", out.Count)
+	}
+	if out.Tree == nil || out.Tree.ID != "root" {
+		t.Fatalf("tree root = %#v, want root", out.Tree)
+	}
+	if findDocumentTreeNode(out.Tree, "projects/deltakv/experiments/2026/06") == nil {
+		t.Fatalf("tree missing DeltaKV ancestor path: %#v", out.Tree)
+	}
+	targetNode := findDocumentTreeNode(out.Tree, target.Path)
+	if targetNode == nil {
+		t.Fatalf("tree missing target path %q: %#v", target.Path, out.Tree)
+	}
+	if targetNode.Project != "deltakv" || targetNode.ResearchID != target.ID || targetNode.Status != "running" {
+		t.Fatalf("target metadata = %#v, want DeltaKV research metadata", targetNode)
+	}
+	if findDocumentTreeNode(out.Tree, support.Path) == nil {
+		t.Fatalf("tree missing support path %q: %#v", support.Path, out.Tree)
+	}
+	if findDocumentTreeNode(out.Tree, other.Path) != nil {
+		t.Fatalf("tree should not include other project path %q: %#v", other.Path, out.Tree)
+	}
+}
+
+func findDocumentTreeNode(node *DocumentTreeNode, path string) *DocumentTreeNode {
+	if node == nil {
+		return nil
+	}
+	if node.Path == path {
+		return node
+	}
+	for i := range node.Children {
+		if found := findDocumentTreeNode(&node.Children[i], path); found != nil {
+			return found
+		}
+	}
+	return nil
+}

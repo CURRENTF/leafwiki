@@ -152,6 +152,35 @@ type Document struct {
 	UpdatedAt    string                 `json:"updatedAt,omitempty"`
 }
 
+type DocumentTreeInput struct {
+	Project string
+	Kind    string
+}
+
+type DocumentTreeOutput struct {
+	Project string            `json:"project,omitempty"`
+	Kind    string            `json:"kind,omitempty"`
+	Count   int               `json:"count"`
+	Tree    *DocumentTreeNode `json:"tree"`
+}
+
+type DocumentTreeNode struct {
+	ID           string             `json:"id"`
+	Path         string             `json:"path"`
+	Title        string             `json:"title"`
+	Slug         string             `json:"slug,omitempty"`
+	Kind         string             `json:"kind"`
+	Position     int                `json:"position"`
+	Project      string             `json:"project,omitempty"`
+	ResearchID   string             `json:"researchId,omitempty"`
+	ResearchKind string             `json:"researchKind,omitempty"`
+	Status       string             `json:"status,omitempty"`
+	Tags         []string           `json:"tags,omitempty"`
+	CreatedAt    string             `json:"createdAt,omitempty"`
+	UpdatedAt    string             `json:"updatedAt,omitempty"`
+	Children     []DocumentTreeNode `json:"children,omitempty"`
+}
+
 type SearchDocumentsInput struct {
 	Query   string
 	Project string
@@ -511,6 +540,39 @@ func (s *Service) ReadDocument(ctx context.Context, input ReadDocumentInput) (*D
 	return s.documentFromPage(page, true)
 }
 
+func (s *Service) DocumentTree(ctx context.Context, input DocumentTreeInput) (*DocumentTreeOutput, error) {
+	_ = ctx
+	if s == nil || s.tree == nil {
+		return nil, fmt.Errorf("research service is not initialized")
+	}
+
+	project := s.slugger.GenerateValidSlug(input.Project)
+	kind := normalizeNodeKind(input.Kind)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	root := s.tree.GetTree()
+	if root == nil {
+		return &DocumentTreeOutput{
+			Project: project,
+			Kind:    kind,
+			Tree:    emptyDocumentTreeRoot(),
+		}, nil
+	}
+
+	treeNode, count := s.buildDocumentTree(root, project, kind, true)
+	if treeNode == nil {
+		treeNode = emptyDocumentTreeRoot()
+	}
+	return &DocumentTreeOutput{
+		Project: project,
+		Kind:    kind,
+		Count:   count,
+		Tree:    treeNode,
+	}, nil
+}
+
 func (s *Service) RecentDocuments(ctx context.Context, input RecentDocumentsInput) (*RecentDocumentsOutput, error) {
 	_ = ctx
 	if s == nil || s.tree == nil {
@@ -554,6 +616,45 @@ func (s *Service) RecentDocuments(ctx context.Context, input RecentDocumentsInpu
 		docs = docs[:limit]
 	}
 	return &RecentDocumentsOutput{Items: docs}, nil
+}
+
+func (s *Service) buildDocumentTree(node *tree.PageNode, project, kind string, isRoot bool) (*DocumentTreeNode, int) {
+	if node == nil {
+		return nil, 0
+	}
+
+	page := &tree.Page{PageNode: node}
+	matched := !isRoot && matchesDocumentFilter(page, project, kind)
+	count := 0
+	if matched {
+		count = 1
+	}
+
+	children := make([]*tree.PageNode, 0, len(node.Children))
+	children = append(children, node.Children...)
+	sort.SliceStable(children, func(i, j int) bool {
+		if children[i] == nil || children[j] == nil {
+			return children[j] != nil
+		}
+		if children[i].Position != children[j].Position {
+			return children[i].Position < children[j].Position
+		}
+		return children[i].ID < children[j].ID
+	})
+
+	treeNode := s.documentTreeNodeFromPageNode(node, isRoot)
+	for _, child := range children {
+		childNode, childCount := s.buildDocumentTree(child, project, kind, false)
+		count += childCount
+		if childNode != nil {
+			treeNode.Children = append(treeNode.Children, *childNode)
+		}
+	}
+
+	if !isRoot && !matched && len(treeNode.Children) == 0 {
+		return nil, count
+	}
+	return treeNode, count
 }
 
 func (s *Service) GetExperimentContext(ctx context.Context, id, query string, limit int) (*ExperimentContext, error) {
@@ -837,6 +938,53 @@ func (s *Service) documentFromPage(page *tree.Page, includeMarkdown bool) (*Docu
 	return doc, nil
 }
 
+func (s *Service) documentTreeNodeFromPageNode(node *tree.PageNode, isRoot bool) *DocumentTreeNode {
+	if node == nil {
+		return emptyDocumentTreeRoot()
+	}
+	kind := string(node.Kind)
+	if isRoot && kind == "" {
+		kind = string(tree.NodeKindSection)
+	}
+	out := &DocumentTreeNode{
+		ID:        node.ID,
+		Path:      strings.Trim(node.CalculatePath(), "/"),
+		Title:     node.Title,
+		Slug:      node.Slug,
+		Kind:      kind,
+		Position:  node.Position,
+		CreatedAt: formatTime(node.Metadata.CreatedAt),
+		UpdatedAt: formatTime(node.Metadata.UpdatedAt),
+	}
+	if isRoot {
+		if out.ID == "" {
+			out.ID = "root"
+		}
+		if out.Title == "" {
+			out.Title = "Root"
+		}
+		return out
+	}
+
+	doc, err := s.documentFromPage(&tree.Page{PageNode: node}, false)
+	if err != nil {
+		out.Project = projectFromPath(out.Path)
+		return out
+	}
+	out.ID = doc.ID
+	out.Path = doc.Path
+	out.Title = doc.Title
+	out.Kind = doc.Kind
+	out.Project = doc.Project
+	out.ResearchID = doc.ResearchID
+	out.ResearchKind = doc.ResearchKind
+	out.Status = doc.Status
+	out.Tags = doc.Tags
+	out.CreatedAt = doc.CreatedAt
+	out.UpdatedAt = doc.UpdatedAt
+	return out
+}
+
 func (s *Service) filteredPageIDs(project, kind string) ([]string, error) {
 	if project == "" && kind == "" {
 		return nil, nil
@@ -855,6 +1003,14 @@ func (s *Service) filteredPageIDs(project, kind string) ([]string, error) {
 		return nil, err
 	}
 	return pageIDs, nil
+}
+
+func emptyDocumentTreeRoot() *DocumentTreeNode {
+	return &DocumentTreeNode{
+		ID:    "root",
+		Title: "Root",
+		Kind:  string(tree.NodeKindSection),
+	}
 }
 
 func matchesDocumentFilter(page *tree.Page, project, kind string) bool {

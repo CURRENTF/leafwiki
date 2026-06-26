@@ -285,6 +285,7 @@ func TestResearchRoutesProtectAgentReadAPIs(t *testing.T) {
 		"/api/research/docs/search?q=needle",
 		"/api/research/docs/read?path=projects/deltakv",
 		"/api/research/docs/recent",
+		"/api/research/docs/tree",
 		"/api/research/experiments/missing/context",
 	}
 	for _, endpoint := range endpoints {
@@ -402,6 +403,61 @@ func TestResearchRoutesExerciseExperimentLifecycleOverHTTP(t *testing.T) {
 		if !strings.Contains(got.Content, needle) {
 			t.Fatalf("get experiment content missing %q:\n%s", needle, got.Content)
 		}
+	}
+}
+
+func TestResearchRoutesExposeDocumentTreeForAgents(t *testing.T) {
+	server := newResearchTestRouter(t)
+	defer server.Close()
+
+	target := createExperimentHTTP(t, server, `{
+		"project":"DeltaKV",
+		"title":"Tree target",
+		"slugHint":"tree-target",
+		"status":"running",
+		"tags":["tree"]
+	}`, http.StatusCreated)
+	support := createExperimentHTTP(t, server, `{
+		"project":"DeltaKV",
+		"title":"Tree support",
+		"slugHint":"tree-support",
+		"status":"completed"
+	}`, http.StatusCreated)
+	other := createExperimentHTTP(t, server, `{
+		"project":"OtherProject",
+		"title":"Tree other",
+		"slugHint":"tree-other"
+	}`, http.StatusCreated)
+
+	var out coreresearch.DocumentTreeOutput
+	status, body := doResearchJSON(t, authedResearchRequest(t, server, http.MethodGet, "/api/research/docs/tree?project=DeltaKV&kind=page", ""), &out)
+	if status != http.StatusOK {
+		t.Fatalf("tree status = %d, want %d, body=%s", status, http.StatusOK, body)
+	}
+	if out.Project != "deltakv" || out.Kind != "page" {
+		t.Fatalf("filters = project %q kind %q, want deltakv/page", out.Project, out.Kind)
+	}
+	if out.Count != 2 {
+		t.Fatalf("count = %d, want 2", out.Count)
+	}
+	if out.Tree == nil || out.Tree.ID != "root" {
+		t.Fatalf("tree root = %#v, want root", out.Tree)
+	}
+	if findResearchDocumentTreeNode(out.Tree, "projects/deltakv/experiments/2026/06") == nil {
+		t.Fatalf("tree missing ancestor path: %#v", out.Tree)
+	}
+	targetNode := findResearchDocumentTreeNode(out.Tree, target.Path)
+	if targetNode == nil {
+		t.Fatalf("tree missing target path %q: %#v", target.Path, out.Tree)
+	}
+	if targetNode.Project != "deltakv" || targetNode.ResearchID != target.ID || targetNode.Status != "running" {
+		t.Fatalf("target metadata = %#v, want DeltaKV research metadata", targetNode)
+	}
+	if findResearchDocumentTreeNode(out.Tree, support.Path) == nil {
+		t.Fatalf("tree missing support path %q: %#v", support.Path, out.Tree)
+	}
+	if findResearchDocumentTreeNode(out.Tree, other.Path) != nil {
+		t.Fatalf("tree should not include other project path %q: %#v", other.Path, out.Tree)
 	}
 }
 
@@ -557,4 +613,19 @@ func documentsContainID(docs []coreresearch.Document, id string) bool {
 		}
 	}
 	return false
+}
+
+func findResearchDocumentTreeNode(node *coreresearch.DocumentTreeNode, path string) *coreresearch.DocumentTreeNode {
+	if node == nil {
+		return nil
+	}
+	if node.Path == path {
+		return node
+	}
+	for i := range node.Children {
+		if found := findResearchDocumentTreeNode(&node.Children[i], path); found != nil {
+			return found
+		}
+	}
+	return nil
 }

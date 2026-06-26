@@ -52,6 +52,7 @@ func (r *Routes) RegisterRoutes(ctx httpinternal.RouterContext) {
 	group.GET("/docs/search", r.handleSearchDocuments)
 	group.GET("/docs/read", r.handleReadDocument)
 	group.GET("/docs/recent", r.handleRecentDocuments)
+	group.GET("/docs/tree", r.handleDocumentTree)
 }
 
 func (r *Routes) requireWriter(ctx httpinternal.RouterContext) gin.HandlerFunc {
@@ -263,6 +264,18 @@ func (r *Routes) handleRecentDocuments(c *gin.Context) {
 		Project: c.Query("project"),
 		Kind:    c.Query("kind"),
 		Limit:   queryInt(c, "limit"),
+	})
+	if err != nil {
+		respondWithResearchErrorForErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (r *Routes) handleDocumentTree(c *gin.Context) {
+	out, err := r.service.DocumentTree(c.Request.Context(), coreresearch.DocumentTreeInput{
+		Project: c.Query("project"),
+		Kind:    c.Query("kind"),
 	})
 	if err != nil {
 		respondWithResearchErrorForErr(c, err)
